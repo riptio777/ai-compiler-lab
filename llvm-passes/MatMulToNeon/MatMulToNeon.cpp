@@ -1,3 +1,4 @@
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Analysis/IVDescriptors.h"
@@ -126,7 +127,7 @@ static void assignRolColFor4x4(RCInfo &RC, LPInfo &LP) {
         int idx = tryInferRowColIndex(AL->getPointerOperand(), LP);
         if (idx > -1) {
             RC.Row = idx / (MAT_COL * ELEM_SIZE);
-            errs() << "Row: " << RC.Row << "\n";
+            //errs() << "Row: " << RC.Row << "\n";
         }
     }
 
@@ -134,7 +135,7 @@ static void assignRolColFor4x4(RCInfo &RC, LPInfo &LP) {
         int idx = tryInferRowColIndex(BL->getPointerOperand(), LP);
         if (idx > -1) {
             RC.Col = idx / ELEM_SIZE;
-            errs() << "Col: " << RC.Col << "\n";
+            //errs() << "Col: " << RC.Col << "\n";
 
         }
     }
@@ -201,6 +202,13 @@ static bool matchFaddOfFmulReduction(PHINode *PN, BasicBlock *Latch,
     return true;
 }
 
+// TODO: Remove, printing for debugging purpose
+void printRC(const RCInfo &RC) {
+    RC.A->dump();
+    RC.B->dump();
+    RC.Add->dump();
+    RC.Mul->dump();
+}
 
 class MatMulToNeonPass : public PassInfoMixin<MatMulToNeonPass> {
 public:
@@ -286,6 +294,14 @@ public:
         Instruction *AddI = nullptr, *MulI = nullptr;
         PHINode *IVPhi = nullptr;
 
+        // Group target PHIs by cols
+        SmallVector<RCInfo, 4> Col0Vec;
+        SmallVector<RCInfo, 4> Col1Vec;
+        SmallVector<RCInfo, 4> Col2Vec;
+        SmallVector<RCInfo, 4> Col3Vec;
+
+        SmallVector<SmallVector<RCInfo, 4>, 4> ColVecs(4);
+
         for (auto &I : *Header) {
             if (auto *Phi = dyn_cast<PHINode>(&I)) {
                 errs() << "Checking phi nodes\n";
@@ -295,24 +311,40 @@ public:
                 }
                 if (matchFaddOfFmulReduction(Phi, Latch, RC)) {
                     errs() << "Matched phi node\n";
-                    RC.A->dump();
-                    RC.B->dump();
-                    RC.Add->dump();
-                    RC.Mul->dump();
+                    //printRC(RC);
                     /*
                     At this point LP should contain info for ABase, BBase and Induction Phi
                     */
                     assignRolColFor4x4(RC, LP); 
+                    assert(RC.Col >= 0 && RC.Col < 4 && "RC column value is out of range.");
+                    //errs() << "RC.Col: " << RC.Col;
+                    ColVecs[RC.Col].push_back(RC);
+
                     Accs.push_back(Phi);
                 }
             }
         }
 
+        // TODO: move this check earlier
         if (Accs.size() < 16) { 
             return false; 
         }
+
+        for (int i = 0; i < ColVecs.size(); i++) {
+            sort(ColVecs[i], [](const RCInfo &rhs, const RCInfo &lhs) {
+                return rhs.Row < lhs.Row;
+            });
+            errs() << "*********** Col: " << i << "**********\n";
+            for (int j = 0; j < ColVecs[i].size(); j++) {
+                //printRC(ColVecs[i][j]);
+                errs() << "Row: " << ColVecs[i][j].Row << "\n";
+                errs() << "Col: " << ColVecs[i][j].Col << "\n";
+            }
+        }
+
+        IRBuilder<> Builder(Latch->getTerminator());
+    
         
-        // Group target PHIs by cols
 
         return true;
     }

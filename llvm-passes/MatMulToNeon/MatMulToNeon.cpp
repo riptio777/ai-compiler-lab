@@ -9,15 +9,20 @@
 #include "llvm/IR/Analysis.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constant.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/IR/FMF.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/IR/IntrinsicsAArch64.h"
@@ -238,7 +243,7 @@ public:
             for (Loop *subLoop : LoopList) {
                 if (subLoop->getSubLoops().empty()) {
                     // found innermost loop
-                    tryRewrite4x4Kernel(*subLoop, SE, LP);
+                    tryRewrite4x4Kernel(F, *subLoop, SE, LP);
                 }
             }
         }
@@ -278,7 +283,7 @@ public:
     }
 
 
-    bool tryRewrite4x4Kernel(Loop &L, ScalarEvolutionAnalysis::Result &SE, LPInfo &LP) {
+    bool tryRewrite4x4Kernel(Function &F, Loop &L, ScalarEvolutionAnalysis::Result &SE, LPInfo &LP) {
         errs() << "Try Rewrite 4x4 Kernel\n";
         BasicBlock *Header = L.getHeader();
         BasicBlock *Body = Header; // deal with single-block loops for now
@@ -336,16 +341,60 @@ public:
             });
             errs() << "*********** Col: " << i << "**********\n";
             for (int j = 0; j < ColVecs[i].size(); j++) {
-                //printRC(ColVecs[i][j]);
+                printRC(ColVecs[i][j]);
                 errs() << "Row: " << ColVecs[i][j].Row << "\n";
                 errs() << "Col: " << ColVecs[i][j].Col << "\n";
             }
         }
 
         IRBuilder<> Builder(Latch->getTerminator());
-    
-        
+        LLVMContext &Ctx = F.getContext();
+        Type *F32 = Type::getFloatTy(Ctx);
+        // Vector to hold a column of matrix A
+        auto *V4F = FixedVectorType::get(F32, 4);
 
+        // ********* first col *************
+        SmallVector<RCInfo, 4> Col0 = ColVecs[0];
+        RCInfo &RC = Col0[0];
+
+        // Create vector phi
+        auto *ZeroV = Constant::getNullValue(V4F);
+        auto *Preheader = L.getLoopPreheader();
+        auto *CVec0 = PHINode::Create(V4F, 2, 
+            "cvec0", Header->getFirstNonPHIIt());
+        CVec0->addIncoming(ZeroV, Preheader);
+
+        Value *ColSplat = Builder.CreateVectorSplat(4, RC.B);
+
+        Value *ColA = PoisonValue::get(V4F);
+
+        // Col0 contains load instructions from column 0 of A, sorted by
+        // row number
+        for (int i = 0; i < Col0.size(); i++) {
+            RCInfo &RC = Col0[i];
+            ColA = Builder.CreateInsertElement(ColA, RC.A, i);
+
+        }
+
+
+        // Preserve FMF - not sure if it's necessary 
+        // TODO: double check 
+        FastMathFlags FMF;
+        if (auto *FPOp = dyn_cast<FPMathOperator>(Col0[0].Add)) {
+            FMF = FPOp->getFastMathFlags();
+            Builder.setFastMathFlags(FMF);
+        }
+
+        // Construct the FMA
+        Function *FMA = Intrinsic::getOrInsertDeclaration(Header->getModule(),
+                             Intrinsic::fma, {V4F});
+        Value *ColAcc = Builder.CreateCall(FMA, {ColA, ColSplat, CVec0});
+        FMA->setAttributes(F.getAttributes());
+        ColAcc->dump();
+
+        CVec0->addIncoming(ColAcc, Latch);
+
+       // col->dump();
         return true;
     }
 };

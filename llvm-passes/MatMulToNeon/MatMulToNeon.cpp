@@ -31,10 +31,15 @@
 #include "llvm/Pass.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
+#include "llvm/Passes/StandardInstrumentations.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/InstructionCost.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/LoopUtils.h"
+#include "llvm/Transforms/Utils/Local.h"
+
+#include <string>
 
 // Deal with 4x4 matrices now
 #define MAT_COL 4
@@ -207,6 +212,27 @@ static bool matchFaddOfFmulReduction(PHINode *PN, BasicBlock *Latch,
     return true;
 }
 
+static void CleanUpScalarPhi(SmallVector<SmallVector<RCInfo, 4>, 4> &ColVecs) {
+    for (int i = 0; i < ColVecs.size(); i++) {
+        auto &ColVecI = ColVecs[i];
+        for (int j = 0; j < ColVecI.size(); j++) {
+            auto &RC = ColVecI[j];
+            auto *PN = RC.PN;
+            auto *AddI = RC.Add;
+            auto *MulI = RC.Mul;
+            if (PN->use_empty()) {
+                errs() << "PN use empty" << "\n";
+                PN->removeFromParent();
+            }
+         /*    if (AddI->use_empty()) {
+                AddI->removeFromParent();
+            }
+            if (MulI->use_empty()) {
+                MulI->removeFromParent();
+            } */
+        }
+    }
+}
 // TODO: Remove, printing for debugging purpose
 void printRC(const RCInfo &RC) {
     RC.A->dump();
@@ -243,7 +269,7 @@ public:
             for (Loop *subLoop : LoopList) {
                 if (subLoop->getSubLoops().empty()) {
                     // found innermost loop
-                    tryRewrite4x4Kernel(F, *subLoop, SE, LP);
+                    tryRewrite4x4Kernel(F, *subLoop, SE, LI, DT, LP);
                 }
             }
         }
@@ -283,7 +309,8 @@ public:
     }
 
 
-    bool tryRewrite4x4Kernel(Function &F, Loop &L, ScalarEvolutionAnalysis::Result &SE, LPInfo &LP) {
+    bool tryRewrite4x4Kernel(Function &F, Loop &L, ScalarEvolutionAnalysis::Result &SE, 
+                            LoopInfo &LI, DominatorTree &DT, LPInfo &LP) {
         errs() << "Try Rewrite 4x4 Kernel\n";
         BasicBlock *Header = L.getHeader();
         BasicBlock *Body = Header; // deal with single-block loops for now
@@ -353,48 +380,110 @@ public:
         // Vector to hold a column of matrix A
         auto *V4F = FixedVectorType::get(F32, 4);
 
-        // ********* first col *************
-        SmallVector<RCInfo, 4> Col0 = ColVecs[0];
-        RCInfo &RC = Col0[0];
+        // Create 4 vector phis
+        SmallVector<PHINode*, 4> VecPNs;
 
-        // Create vector phi
-        auto *ZeroV = Constant::getNullValue(V4F);
-        auto *Preheader = L.getLoopPreheader();
-        auto *CVec0 = PHINode::Create(V4F, 2, 
-            "cvec0", Header->getFirstNonPHIIt());
-        CVec0->addIncoming(ZeroV, Preheader);
+        for(int k = 0; k < 4; k++) {
+            auto CVecK = PHINode::Create(V4F, 2,
+            "cvec"+Twine(k), Header->getFirstNonPHIIt());
+            SmallVector<RCInfo, 4> ColK = ColVecs[k];
 
-        Value *ColSplat = Builder.CreateVectorSplat(4, RC.B);
+            // Create vector phi
+            auto *ZeroV = Constant::getNullValue(V4F);
+            auto *Preheader = L.getLoopPreheader();
 
-        Value *ColA = PoisonValue::get(V4F);
+            CVecK->addIncoming(ZeroV, Preheader);
 
-        // Col0 contains load instructions from column 0 of A, sorted by
-        // row number
-        for (int i = 0; i < Col0.size(); i++) {
-            RCInfo &RC = Col0[i];
-            ColA = Builder.CreateInsertElement(ColA, RC.A, i);
+            // Used for splatting B
+            // Using first phi in the ColK vector, since they
+            // all share the same B column
+            RCInfo &RC = ColK[0];
+            Value *ColSplat = Builder.CreateVectorSplat(4, RC.B);
 
+            Value *ColA = PoisonValue::get(V4F);
+            // ColK contains load instructions from column 0 of A, sorted by
+            // row number
+            for (int i = 0; i < ColK.size(); i++) {
+                RCInfo &RC = ColK[i];
+                ColA = Builder.CreateInsertElement(ColA, RC.A, i);
+
+            }
+
+
+            // Preserve FMF - not sure if it's necessary 
+            // TODO: double check 
+            FastMathFlags FMF;
+            if (auto *FPOp = dyn_cast<FPMathOperator>(ColK[0].Add)) {
+                FMF = FPOp->getFastMathFlags();
+                Builder.setFastMathFlags(FMF);
+            }
+
+            // Construct the FMA
+            Function *FMA = Intrinsic::getOrInsertDeclaration(Header->getModule(),
+                                Intrinsic::fma, {V4F});
+            Value *ColAcc = Builder.CreateCall(FMA, {ColA, ColSplat, CVecK});
+            FMA->setAttributes(F.getAttributes());
+        //    ColAcc->dump();
+
+            CVecK->addIncoming(ColAcc, Latch);
+            VecPNs.push_back(CVecK);
+        } // End for loop for one k (B[j][0] -> B[j][k])
+
+
+        // Replace scalars with vector phi
+        // Traverse through all phi nodes storing the result before 
+        // vectorization
+        // ColVecs groups phi nodes by column
+        IRBuilder<> HB(&(*Header->getFirstNonPHIIt()));
+        for (int k = 0; k < ColVecs.size(); k++) {
+            auto &ColK = ColVecs[k];
+            // Traverse each row in one column
+            for (int i = 0; i < ColK.size(); i++) {
+                auto &RC = ColK[i];
+                auto *PN = RC.PN;
+
+                Value *ResVal = HB.CreateExtractElement(VecPNs[k], i);
+     /*            errs() << "K " << k << "\n";
+                errs() << "ResVal: ";
+                ResVal->dump(); */
+                // Replace all uses inside the loop
+                PN->replaceAllUsesWith(ResVal);
+                bool Changed = formLCSSA(L, DT, &LI, &SE);
+                if (Changed) {
+                    errs() << "Loop changed by LCSSA" << "\n";
+                }
+/* 
+                SmallVector<Use*, 8> ToReplace;
+                for (Use &U : PN->uses()) {
+                    if (auto *UserI = dyn_cast<Instruction>(U.getUser())) {
+                        //if (L.contains(UserI->getParent())) {
+                            ToReplace.push_back(&U);
+                            errs() << "UserI: ";
+                            UserI->dump();
+                        //}
+                        errs() << "UserI: ";
+                        UserI->dump();
+                        errs() << "UserI->getParent()" << UserI->getParent()->getName();
+                       // if (L.contains(UserI->getParent()))
+                    }
+                }
+
+                for (Use *U : ToReplace) {
+                    U->set(ResVal);
+                } */
+
+                // Remove replaced scalar code
+/*                 RC.Add->eraseFromParent();
+                if (RC.Mul->use_empty()) {
+                    RC.Mul->eraseFromParent();
+                } */
+               RecursivelyDeleteTriviallyDeadInstructions(PN);
+
+            }
         }
 
+       // CleanUpScalarPhi(ColVecs);
 
-        // Preserve FMF - not sure if it's necessary 
-        // TODO: double check 
-        FastMathFlags FMF;
-        if (auto *FPOp = dyn_cast<FPMathOperator>(Col0[0].Add)) {
-            FMF = FPOp->getFastMathFlags();
-            Builder.setFastMathFlags(FMF);
-        }
-
-        // Construct the FMA
-        Function *FMA = Intrinsic::getOrInsertDeclaration(Header->getModule(),
-                             Intrinsic::fma, {V4F});
-        Value *ColAcc = Builder.CreateCall(FMA, {ColA, ColSplat, CVec0});
-        FMA->setAttributes(F.getAttributes());
-        ColAcc->dump();
-
-        CVec0->addIncoming(ColAcc, Latch);
-
-       // col->dump();
         return true;
     }
 };

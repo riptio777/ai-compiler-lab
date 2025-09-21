@@ -122,7 +122,7 @@ static int tryInferRowColIndex(Value *Ptr, LPInfo &LP) {
     return -1;
 }
 
-static void assignRolColFor4x4(RCInfo &RC, LPInfo &LP) {
+static bool assignRolColFor4x4(RCInfo &RC, LPInfo &LP) {
     // Grab the load instructions
     auto *AL = dyn_cast<LoadInst>(RC.A);
     auto *BL = dyn_cast<LoadInst>(RC.B);
@@ -138,6 +138,12 @@ static void assignRolColFor4x4(RCInfo &RC, LPInfo &LP) {
         if (idx > -1) {
             RC.Row = idx / (MAT_COL * ELEM_SIZE);
             //errs() << "Row: " << RC.Row << "\n";
+        } else {
+            // Didn't successfully infer Row info
+            // For now, print out message and exit
+            errs() << "Did not successfully infer Row info for loadInst ";
+            AL->dump();
+            return false;
         }
     }
 
@@ -147,9 +153,14 @@ static void assignRolColFor4x4(RCInfo &RC, LPInfo &LP) {
             RC.Col = idx / ELEM_SIZE;
             //errs() << "Col: " << RC.Col << "\n";
 
+        } else {
+            // Same handling as Row
+            errs() << "Did not successfully infer Col info for loadInst ";
+            BL->dump();
+            return false;
         }
     }
-
+    return true;
 }
 // Check if this phi node is zero-initiated and of float value type
 // E.g., %c00 = phi float [ 0.0, %entry ], [ %c00.n, %kloop ]
@@ -257,7 +268,8 @@ public:
         LPInfo LP;
         // Add function arguments, right now we assume 
         // that Matrix A is passed in as arg0 and B as arg1
-        assert(F.arg_size() >= 2 && "This function should have at least 2 arguments");
+        //assert(F.arg_size() >= 2 && "This function should have at least 2 arguments");
+        if (F.arg_size() < 2) return PreservedAnalyses::all();
         // TODO: Not robust handling
         LP.ABase = F.getArg(0);
         LP.BBase = F.getArg(1);
@@ -347,12 +359,14 @@ public:
                     /*
                     At this point LP should contain info for ABase, BBase and Induction Phi
                     */
-                    assignRolColFor4x4(RC, LP); 
-                    assert(RC.Col >= 0 && RC.Col < 4 && "RC column value is out of range.");
+                    if(assignRolColFor4x4(RC, LP)) {
+                        ColVecs[RC.Col].push_back(RC);
+                        Accs.push_back(Phi);
+                    } else {
+                        return false;
+                    }
                     //errs() << "RC.Col: " << RC.Col;
-                    ColVecs[RC.Col].push_back(RC);
 
-                    Accs.push_back(Phi);
                 }
             }
         }

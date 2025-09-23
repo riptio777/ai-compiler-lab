@@ -1,6 +1,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/Analysis/IVDescriptors.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
@@ -32,6 +33,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Passes/StandardInstrumentations.h"
+#include "llvm/Support/Alignment.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/InstructionCost.h"
@@ -59,7 +61,7 @@ struct RCInfo {
     Value *A; // %1 (%1 = load float, ptr %arrayidx9, align 4)
     Value *B; // %10 (%10 = load float, ptr %arrayidx16, align 4)
     /*
-    %0 = getelementptr inbounds nuw float, ptr %A, i64 %indvars.iv
+    %0 = getelementptr inbounds nuw float, ptr %A, i64 %invdars.iv
     arrayidx9 = getelementptr inbounds nuw i8, ptr %0, i64 48
     => A[k+48] => A[3][k] (in matrix representation)
     */
@@ -352,6 +354,7 @@ public:
                 RCInfo RC;
                 if (InductionDescriptor::isInductionPHI(Phi, &L, &SE, ID)) {
                     LP.IVPhi = Phi;
+                    IVPhi = Phi;
                 }
                 if (matchFaddOfFmulReduction(Phi, Latch, RC)) {
                     errs() << "Matched phi node\n";
@@ -388,7 +391,10 @@ public:
             }
         }
 
+        // IR builders, one for Latch, one for Header
         IRBuilder<> Builder(Latch->getTerminator());
+        IRBuilder<> HB(&(*Header->getFirstNonPHIIt()));
+
         LLVMContext &Ctx = F.getContext();
         Type *F32 = Type::getFloatTy(Ctx);
         // Vector to hold a column of matrix A
@@ -397,16 +403,59 @@ public:
         // Create 4 vector phis
         SmallVector<PHINode*, 4> VecPNs;
 
+        // Create 4 vector phis for odd iterations - 1, 3
+        SmallVector<PHINode*, 4> VecPNsOdd;
+
+        auto C1 = ConstantInt::get(IVPhi->getType(), 1);
+        // Create IV+1 phi node, IV is k, so this is k+1
+        // TODO: hasNUW and hasNSW set to true??
+        auto *IVK1 = HB.CreateAdd(IVPhi, C1, IVPhi->getName()+Twine("k1"),
+                                    false, false);
+
+        // Populate rows of A (of one column) into one vector register outside of the loop below,
+        // since it's updated by the induction variable
+        SmallVector<RCInfo, 4> ColA = ColVecs[0];
+
+
+        Value *ColAVec = PoisonValue::get(V4F);
+        // ColK contains load instructions from column 0 of A, sorted by
+        // row number
+        for (int i = 0; i < ColA.size(); i++) {
+            RCInfo &RC = ColA[i];
+            // TODO: maybe change the index to Builder.getInt32(i)
+            ColAVec = Builder.CreateInsertElement(ColAVec, RC.A, i);
+        }
+
+        // TODO: hard coded 4 since we are doing 4x4 tiling
+        for (int r = 0; r < 4; r++) {
+            // Unroll indvars.iv by 2, so create A row vec for next column of A (in the same loop body of the IR)
+            auto CI_row4 = ConstantInt::get(IVK1->getType(), r * 4);
+            // Calculate index into A
+            Value *Idx = Builder.CreateAdd(CI_row4, IVK1, 
+                                    "a_idx_"+Twine(r)+ "_k1", true, true);
+            // Get pointer value at A[Idx]
+            Value *A_ptr_k1 = Builder.CreateGEP(F32, LP.ABase, 
+                            Idx, "a_idx_"+Twine(r)+ "_k1_ptr");
+            
+            // Create Load inst from the pointer value of A[Idx]
+            LoadInst *A_ptr_k1_ld = Builder.CreateLoad(F32, A_ptr_k1, "a_"+Twine(r)+"_k1");
+            A_ptr_k1_ld->setAlignment(Align(4));
+        }
+
         for(int k = 0; k < 4; k++) {
             auto CVecK = PHINode::Create(V4F, 2,
             "cvec"+Twine(k), Header->getFirstNonPHIIt());
             SmallVector<RCInfo, 4> ColK = ColVecs[k];
+            // CVecK_1 for unrolling K by 2
+            auto CVecK_1 = PHINode::Create(V4F, 2,
+            "cvec"+Twine(k)+Twine(1), Header->getFirstNonPHIIt());
 
             // Create vector phi
             auto *ZeroV = Constant::getNullValue(V4F);
             auto *Preheader = L.getLoopPreheader();
 
             CVecK->addIncoming(ZeroV, Preheader);
+            CVecK_1->addIncoming(ZeroV, Preheader);
 
             // Used for splatting B
             // Using first phi in the ColK vector, since they
@@ -414,16 +463,32 @@ public:
             RCInfo &RC = ColK[0];
             Value *ColSplat = Builder.CreateVectorSplat(4, RC.B);
 
-            Value *ColA = PoisonValue::get(V4F);
-            // ColK contains load instructions from column 0 of A, sorted by
-            // row number
-            for (int i = 0; i < ColK.size(); i++) {
-                RCInfo &RC = ColK[i];
-                ColA = Builder.CreateInsertElement(ColA, RC.A, i);
+            // Unroll BVec creation
+            // Same column, next row, indexed by indvars.iv + 1
+            auto C4 = ConstantInt::get(IVK1->getType(), 4);
+            auto Cj = ConstantInt::get(IVK1->getType(), RC.Col);
 
-            }
+            // Construct GEP and load for B[IVK1*4+j]
+            // Same column as indexed by indvars.iv, but the next row
+            Value *IdxK1_4 = Builder.CreateMul(IVK1, C4, 
+                "b_idx_k1x4_"+Twine(k),true, true);
 
+            // IVK1*4 + j
+            Value *IdxB = Builder.CreateAdd(IdxK1_4, Cj, 
+                "b_idx_k1x4j_"+Twine(k), true, true);
+            
+            // Get pointer address B[4(indvar.iv+1)+j] and load
+            Value *B_ptr_k1 = Builder.CreateGEP(F32, LP.BBase, IdxB, "b_idx_k1_ptr");
 
+            LoadInst *B_k1_ld = Builder.CreateAlignedLoad(F32, LP.BBase, 
+                Align(4),"b_"+Twine(k)+"_j_k1");
+
+         /*    // Create load instruction for A[0][k+1]->A[3][k+1]
+            // Create GEP for k+1 
+            // GEP for k: %0 = getelementptr inbounds nuw float, ptr %A, i64 %indvars.iv
+            Type *F32 = Type::getFloatTy(Builder.getContext());
+            Value *RowA_K1 = Builder.CreateInBoundsGEP(F32, LP.ABase, IVK1, "A_k1");
+ */
             // Preserve FMF - not sure if it's necessary 
             // TODO: double check 
             FastMathFlags FMF;
@@ -435,7 +500,7 @@ public:
             // Construct the FMA
             Function *FMA = Intrinsic::getOrInsertDeclaration(Header->getModule(),
                                 Intrinsic::fma, {V4F});
-            Value *ColAcc = Builder.CreateCall(FMA, {ColA, ColSplat, CVecK});
+            Value *ColAcc = Builder.CreateCall(FMA, {ColAVec, ColSplat, CVecK});
             FMA->setAttributes(F.getAttributes());
         //    ColAcc->dump();
 
@@ -448,7 +513,6 @@ public:
         // Traverse through all phi nodes storing the result before 
         // vectorization
         // ColVecs groups phi nodes by column
-        IRBuilder<> HB(&(*Header->getFirstNonPHIIt()));
         for (int k = 0; k < ColVecs.size(); k++) {
             auto &ColK = ColVecs[k];
             // Traverse each row in one column

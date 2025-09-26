@@ -1,4 +1,5 @@
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
@@ -38,6 +39,7 @@
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/InstructionCost.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/IPO/HotColdSplitting.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
 
@@ -426,6 +428,8 @@ public:
             ColAVec = Builder.CreateInsertElement(ColAVec, RC.A, i);
         }
 
+        /***** unrolling */
+        Value *ColAVec_k1 = PoisonValue::get(V4F);
         // TODO: hard coded 4 since we are doing 4x4 tiling
         for (int r = 0; r < 4; r++) {
             // Unroll indvars.iv by 2, so create A row vec for next column of A (in the same loop body of the IR)
@@ -440,7 +444,13 @@ public:
             // Create Load inst from the pointer value of A[Idx]
             LoadInst *A_ptr_k1_ld = Builder.CreateLoad(F32, A_ptr_k1, "a_"+Twine(r)+"_k1");
             A_ptr_k1_ld->setAlignment(Align(4));
+            ColAVec_k1 = Builder.CreateInsertElement(ColAVec_k1, A_ptr_k1_ld, r);
         }
+        /***** unrolling ---*/
+        // Create vectors for storing the result phi nodes
+        // So we can combine them later
+        SmallVector<PHINode*, 4> CVecPhisK;
+        SmallVector<PHINode*, 4> CVecPhisK_1;
 
         for(int k = 0; k < 4; k++) {
             auto CVecK = PHINode::Create(V4F, 2,
@@ -448,7 +458,9 @@ public:
             SmallVector<RCInfo, 4> ColK = ColVecs[k];
             // CVecK_1 for unrolling K by 2
             auto CVecK_1 = PHINode::Create(V4F, 2,
-            "cvec"+Twine(k)+Twine(1), Header->getFirstNonPHIIt());
+            "cvec"+Twine(k)+"_1", Header->getFirstNonPHIIt());
+            CVecPhisK.push_back(CVecK);
+            CVecPhisK_1.push_back(CVecK_1);
 
             // Create vector phi
             auto *ZeroV = Constant::getNullValue(V4F);
@@ -473,6 +485,7 @@ public:
             Value *IdxK1_4 = Builder.CreateMul(IVK1, C4, 
                 "b_idx_k1x4_"+Twine(k),true, true);
 
+            /***** unrolling */
             // IVK1*4 + j
             Value *IdxB = Builder.CreateAdd(IdxK1_4, Cj, 
                 "b_idx_k1x4j_"+Twine(k), true, true);
@@ -480,8 +493,12 @@ public:
             // Get pointer address B[4(indvar.iv+1)+j] and load
             Value *B_ptr_k1 = Builder.CreateGEP(F32, LP.BBase, IdxB, "b_idx_k1_ptr");
 
-            LoadInst *B_k1_ld = Builder.CreateAlignedLoad(F32, LP.BBase, 
+            LoadInst *B_k1_ld = Builder.CreateAlignedLoad(F32, B_ptr_k1, 
                 Align(4),"b_"+Twine(k)+"_j_k1");
+            
+            Value *ColSplat_k1 = Builder.CreateVectorSplat(4, B_k1_ld);
+            /***** unrolling ---*/
+            
 
          /*    // Create load instruction for A[0][k+1]->A[3][k+1]
             // Create GEP for k+1 
@@ -502,12 +519,29 @@ public:
                                 Intrinsic::fma, {V4F});
             Value *ColAcc = Builder.CreateCall(FMA, {ColAVec, ColSplat, CVecK});
             FMA->setAttributes(F.getAttributes());
-        //    ColAcc->dump();
+            // ColAcc->dump();
 
             CVecK->addIncoming(ColAcc, Latch);
             VecPNs.push_back(CVecK);
+
+            /***** unrolling */
+            // TODO: probably should just reuse FMA from above?
+            Function *FMA_k1 = Intrinsic::getOrInsertDeclaration(Header->getModule(), 
+                                Intrinsic::fma, {V4F});
+            Value *ColAcc_k1 = Builder.CreateCall(FMA_k1, {ColAVec_k1, ColSplat_k1, CVecK_1});
+            FMA_k1->setAttributes(F.getAttributes());
+            CVecK_1->addIncoming(ColAcc_k1, Latch);
+            // TODO: VecPN is probably no longer needed after unrolling
+            VecPNs.push_back(CVecK_1);
+            
+
         } // End for loop for one k (B[j][0] -> B[j][k])
 
+        Value *CRes[4];
+        // TODO: hardcoded 4
+        for (int i = 0; i < 4; i++) {
+            CRes[i] = HB.CreateFAdd(CVecPhisK[i], CVecPhisK_1[i]);
+        }
 
         // Replace scalars with vector phi
         // Traverse through all phi nodes storing the result before 
@@ -520,7 +554,8 @@ public:
                 auto &RC = ColK[i];
                 auto *PN = RC.PN;
 
-                Value *ResVal = HB.CreateExtractElement(VecPNs[k], i);
+                //Value *ResVal = HB.CreateExtractElement(VecPNs[k], i);
+                Value *ResVal = HB.CreateExtractElement(CRes[k], i);
      /*            errs() << "K " << k << "\n";
                 errs() << "ResVal: ";
                 ResVal->dump(); */
@@ -558,7 +593,16 @@ public:
                RecursivelyDeleteTriviallyDeadInstructions(PN);
 
             }
-        }
+        } // End of for loop
+
+        // For unrolling, change IV increment to +2
+        Value *StepTwo = ConstantInt::get(IVPhi->getType(), 2);
+        Value *NewPhiUpdate = Builder.CreateAdd(IVPhi, StepTwo, "iv.next2", "true", "true");
+        IVPhi->setIncomingValueForBlock(Latch, NewPhiUpdate);
+
+        /******* Unrolling */
+        // Combine the results from k and k+1 
+
 
        // CleanUpScalarPhi(ColVecs);
 
